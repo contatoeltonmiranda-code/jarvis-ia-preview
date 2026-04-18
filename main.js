@@ -35,6 +35,12 @@
     ELEVENLABS_TIMEOUT_MS: 15000,
     JARVIS_CHAT_URL: 'https://n8n.eltonmiranda.com.br/webhook/jarvis-chat',
     JARVIS_CHAT_TIMEOUT_MS: 20000,
+    STT_RESUME_DELAY_MS: 500,
+    ECHO_SIMILARITY_THRESHOLD: 0.5,
+    WORD_FADE_IN_MS: 150,
+    WORD_FADE_OUT_MS: 60,
+    WORD_FADE_TRANSITION_MS: 600,
+    WORD_TARGET_OPACITY: 0.5,
   };
 
   // --- State ---
@@ -69,12 +75,14 @@
   var ttsRequestSeq = 0;
   var chatRequestSeq = 0;
   var isProcessing = false;
+  var lastJarvisReply = '';
+  var sttResumeTimer = null;
 
   // DOM elements
   var micBtn, statusText, volumeMeter, volumeBars;
-  var transcriptContainer, transcriptText, interimText;
-  var responseContainer, responseText;
+  var responseContainer;
   var voiceSelect, providerToggle;
+  var responseSeq = 0;
 
   // --- Initialization ---
   function init() {
@@ -84,11 +92,7 @@
     micBtn = document.getElementById('mic-btn');
     statusText = document.getElementById('status-text');
     volumeMeter = document.getElementById('volume-meter');
-    transcriptContainer = document.getElementById('transcript-container');
-    transcriptText = document.getElementById('transcript-text');
-    interimText = document.getElementById('interim-text');
     responseContainer = document.getElementById('response-container');
-    responseText = document.getElementById('response-text');
     voiceSelect = document.getElementById('voice-select');
     providerToggle = document.getElementById('provider-toggle');
 
@@ -189,7 +193,13 @@
       return;
     }
 
-    navigator.mediaDevices.getUserMedia({ audio: true })
+    navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
       .then(function (stream) {
         micStream = stream;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -204,7 +214,7 @@
 
         isListening = true;
         micBtn.classList.add('active');
-        setStatus('LISTENING', true);
+        setStatus('OUVINDO', true);
         volumeMeter.classList.add('visible');
 
         // Start STT alongside the audio stream
@@ -212,13 +222,14 @@
       })
       .catch(function (err) {
         console.error('Microphone error:', err);
-        setStatus('MIC ACCESS DENIED', false);
+        setStatus('MIC NEGADO', false);
       });
   }
 
   function stopMicrophone() {
     stopRecognition();
     cancelTTS();
+    lastJarvisReply = '';
 
     if (micStream) {
       micStream.getTracks().forEach(function (track) { track.stop(); });
@@ -234,10 +245,9 @@
     audioLevel = 0;
     smoothedLevel = 0;
     micBtn.classList.remove('active');
-    setStatus('STANDBY', false);
+    setStatus('ESPERA', false);
     volumeMeter.classList.remove('visible');
     updateVolumeMeter(0);
-    clearTranscript();
     clearResponse();
   }
 
@@ -287,7 +297,7 @@
 
   function startRecognition() {
     if (!sttSupported || !recognition) {
-      setStatus('STT NOT SUPPORTED', false);
+      setStatus('STT NAO SUPORTADO', false);
       return;
     }
     finalTranscriptBuffer = '';
@@ -301,14 +311,49 @@
 
   function stopRecognition() {
     if (!recognition) return;
-    try { recognition.stop(); } catch (err) { /* noop */ }
+    // abort() discards any buffered audio; safer than stop() which may still
+    // fire a final onresult with whatever was captured so far.
+    try { recognition.abort(); } catch (err) { /* noop */ }
     if (silenceTimer) {
       clearTimeout(silenceTimer);
       silenceTimer = null;
     }
   }
 
+  function pauseRecognitionForTTS() {
+    if (sttResumeTimer) {
+      clearTimeout(sttResumeTimer);
+      sttResumeTimer = null;
+    }
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
+    finalTranscriptBuffer = '';
+    if (recognition) {
+      try { recognition.abort(); } catch (err) { /* noop */ }
+    }
+  }
+
+  function scheduleResumeRecognition() {
+    if (sttResumeTimer) clearTimeout(sttResumeTimer);
+    sttResumeTimer = setTimeout(function () {
+      sttResumeTimer = null;
+      if (!isListening || isSpeaking || isProcessing) return;
+      if (!recognition) return;
+      finalTranscriptBuffer = '';
+      try { recognition.start(); } catch (err) { /* already started — ignore */ }
+    }, CONFIG.STT_RESUME_DELAY_MS);
+  }
+
   function handleRecognitionResult(event) {
+    // Anti-echo guard: drop anything the mic captured while Jarvis was
+    // speaking or the app was processing. These events can arrive even after
+    // abort() on some browsers.
+    if (isSpeaking || isProcessing) {
+      return;
+    }
+
     var interim = '';
     var finalChunk = '';
     for (var i = event.resultIndex; i < event.results.length; i++) {
@@ -322,13 +367,11 @@
     }
 
     if (interim) {
-      showTranscript(finalTranscriptBuffer, interim);
       resetSilenceTimer();
     }
 
     if (finalChunk) {
       finalTranscriptBuffer = (finalTranscriptBuffer + ' ' + finalChunk).trim();
-      showTranscript(finalTranscriptBuffer, '');
       resetSilenceTimer();
     }
   }
@@ -340,20 +383,22 @@
       return;
     }
     if (err === 'not-allowed' || err === 'service-not-allowed') {
-      setStatus('STT PERMISSION DENIED', false);
+      setStatus('PERMISSAO STT NEGADA', false);
       return;
     }
     console.warn('STT error:', err);
   }
 
   function handleRecognitionEnd() {
-    // Auto-restart while user is still listening (continuous mode can drop)
-    if (isListening && !isSpeaking) {
-      try {
-        recognition.start();
-      } catch (err) {
-        // ignore double-start
-      }
+    // Do NOT auto-restart while Jarvis is speaking or we're still processing
+    // a previous sentence. That was the cause of the feedback loop: onend
+    // would fire after stop() during PROCESSING and silently re-open the mic,
+    // which then captured Jarvis's own voice playback.
+    if (!isListening || isSpeaking || isProcessing) return;
+    try {
+      recognition.start();
+    } catch (err) {
+      // ignore double-start
     }
   }
 
@@ -368,13 +413,52 @@
     }, CONFIG.SILENCE_TIMEOUT_MS);
   }
 
+  function normalizeText(s) {
+    if (!s) return '';
+    var str = String(s).toLowerCase();
+    if (typeof str.normalize === 'function') {
+      str = str.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); // strip accents
+    }
+    return str.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function jaccardSimilarity(a, b) {
+    var wA = normalizeText(a).split(' ').filter(Boolean);
+    var wB = normalizeText(b).split(' ').filter(Boolean);
+    if (!wA.length || !wB.length) return 0;
+    var setA = {};
+    for (var i = 0; i < wA.length; i++) setA[wA[i]] = 1;
+    var inter = 0;
+    var union = {};
+    for (var k in setA) union[k] = 1;
+    for (var j = 0; j < wB.length; j++) {
+      if (setA[wB[j]]) inter++;
+      union[wB[j]] = 1;
+    }
+    var unionSize = 0;
+    for (var u in union) unionSize++;
+    return unionSize ? inter / unionSize : 0;
+  }
+
   function handleUserSentence(sentence) {
+    // Echo guard: if the STT picked up something very similar to the last
+    // Jarvis reply, assume it's mic feedback (TTS bleed-through) and drop it.
+    if (lastJarvisReply) {
+      var sim = jaccardSimilarity(sentence, lastJarvisReply);
+      if (sim >= CONFIG.ECHO_SIMILARITY_THRESHOLD) {
+        console.log('[Jarvis] echo detected (sim=' + sim.toFixed(2) + '), ignoring:', sentence);
+        return;
+      }
+    }
+
     var seq = ++chatRequestSeq;
     isProcessing = true;
-    setStatus('PROCESSING', true);
+    setStatus('PROCESSANDO', true);
 
-    // Pause STT while we wait for the reply (avoid racing onend)
-    try { recognition && recognition.stop(); } catch (err) { /* noop */ }
+    // Hard-pause STT while we wait for the reply. abort() discards any
+    // audio still in the recognizer's buffer, and we reset the transcript
+    // buffer so a stale interim result can't re-trigger handleUserSentence.
+    pauseRecognitionForTTS();
 
     var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     var timeoutId = setTimeout(function () {
@@ -418,15 +502,18 @@
         var reply = (data && typeof data.response === 'string' && data.response.trim())
           ? data.response.trim()
           : 'Desculpe, nao entendi.';
+        lastJarvisReply = reply;
         isProcessing = false;
         speak(reply);
       })
       .catch(function (err) {
         clearTimeout(timeoutId);
         if (seq !== chatRequestSeq) return;
+        var errReply = 'Desculpe, falha na conexao.';
+        lastJarvisReply = errReply;
         isProcessing = false;
         console.error('[Jarvis] chat error:', err && err.message);
-        speak('Desculpe, falha na conexao.');
+        speak(errReply);
       });
   }
 
@@ -573,8 +660,8 @@
   function speak(text) {
     cancelTTS();
     showResponse(text);
-    // Pause STT while Jarvis speaks (avoid feedback loop)
-    try { recognition && recognition.stop(); } catch (err) { /* noop */ }
+    // Hard-pause STT while Jarvis speaks (avoid feedback loop)
+    pauseRecognitionForTTS();
 
     if (ttsProvider === 'elevenlabs') {
       speakElevenLabs(text);
@@ -586,7 +673,7 @@
   function speakElevenLabs(text) {
     var seq = ++ttsRequestSeq;
     isProcessing = true;
-    setStatus('PROCESSING', true);
+    setStatus('PROCESSANDO', true);
 
     var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     var timeoutId = setTimeout(function () {
@@ -626,10 +713,19 @@
         var audio = new Audio(url);
         currentAudio = audio;
 
+        // CRITICAL: set isSpeaking=true BEFORE play(). Doing this in
+        // audio.onplay leaves a window where the TTS is starting to come
+        // out of the speakers but the STT guard still sees isSpeaking=false,
+        // and any onend/onresult firing in that window will re-open the mic.
+        isProcessing = false;
+        isSpeaking = true;
+        setStatus('FALANDO', true);
+        pauseRecognitionForTTS();
+
         audio.onplay = function () {
-          isProcessing = false;
-          isSpeaking = true;
-          setStatus('SPEAKING', true);
+          // Reaffirm the abort once playback truly starts — covers cases
+          // where Chrome might have re-attached the recognizer.
+          pauseRecognitionForTTS();
         };
         audio.onended = function () {
           releaseAudio();
@@ -646,6 +742,8 @@
           playPromise.catch(function (err) {
             console.warn('[Jarvis] audio.play() rejected:', err && err.message);
             releaseAudio();
+            // Reset flags so fallback can re-set them
+            isSpeaking = false;
             speakWebSpeech(text);
           });
         }
@@ -667,7 +765,7 @@
     try { window.speechSynthesis.cancel(); } catch (err) { /* noop */ }
 
     isSpeaking = true;
-    setStatus('SPEAKING', true);
+    setStatus('FALANDO', true);
 
     var utter = new SpeechSynthesisUtterance(text);
     if (ptVoice) {
@@ -689,11 +787,13 @@
     isSpeaking = false;
     ttsLevel = 0;
     if (isListening) {
-      setStatus('LISTENING', true);
-      // Resume STT after TTS finishes
-      try { recognition && recognition.start(); } catch (err) { /* noop */ }
+      setStatus('OUVINDO', true);
+      // Resume STT with a small delay so the tail of the TTS audio
+      // (especially on bluetooth / cheap speakers with latency) doesn't
+      // bleed into the mic and trigger another round.
+      scheduleResumeRecognition();
     } else {
-      setStatus('STANDBY', false);
+      setStatus('ESPERA', false);
     }
   }
 
@@ -717,6 +817,10 @@
   function cancelTTS() {
     ttsRequestSeq++; // invalidate any in-flight TTS fetch
     chatRequestSeq++; // invalidate any in-flight chat fetch
+    if (sttResumeTimer) {
+      clearTimeout(sttResumeTimer);
+      sttResumeTimer = null;
+    }
     if (ttsSupported) {
       try { window.speechSynthesis.cancel(); } catch (err) { /* noop */ }
     }
@@ -749,33 +853,58 @@
     }
   }
 
-  // --- Transcript / Response UI ---
-  function showTranscript(finalText, interim) {
-    if (!transcriptContainer) return;
-    transcriptText.textContent = finalText || '';
-    interimText.textContent = interim || '';
-    if ((finalText && finalText.length) || (interim && interim.length)) {
-      transcriptContainer.classList.add('visible');
-    }
-  }
-
-  function clearTranscript() {
-    if (!transcriptContainer) return;
-    transcriptText.textContent = '';
-    interimText.textContent = '';
-    transcriptContainer.classList.remove('visible');
-  }
-
+  // --- Floating response UI (word-by-word fade) ---
   function showResponse(text) {
-    if (!responseContainer) return;
-    responseText.textContent = text;
-    responseContainer.classList.add('visible');
+    if (!responseContainer || !text) return;
+    var seq = ++responseSeq;
+    var oldWords = responseContainer.querySelectorAll('.word');
+    var oldLen = oldWords.length;
+
+    // Fade out existing words
+    for (var i = 0; i < oldLen; i++) {
+      var w = oldWords[i];
+      w.style.transitionDuration = CONFIG.WORD_FADE_TRANSITION_MS + 'ms';
+      w.style.transitionDelay = (i * CONFIG.WORD_FADE_OUT_MS) + 'ms';
+      w.style.opacity = '0';
+    }
+
+    var clearDelay = oldLen ? (oldLen * CONFIG.WORD_FADE_OUT_MS + CONFIG.WORD_FADE_TRANSITION_MS) : 0;
+
+    setTimeout(function () {
+      if (seq !== responseSeq) return; // newer response superseded us
+      responseContainer.innerHTML = '';
+      var words = String(text).split(/\s+/).filter(Boolean);
+      for (var j = 0; j < words.length; j++) {
+        (function (idx, word) {
+          var span = document.createElement('span');
+          span.className = 'word';
+          span.textContent = word;
+          responseContainer.appendChild(span);
+          // Two RAFs to ensure the initial opacity:0 paints before transition
+          requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+              if (seq !== responseSeq) return;
+              span.style.transitionDelay = (idx * CONFIG.WORD_FADE_IN_MS) + 'ms';
+              span.style.opacity = String(CONFIG.WORD_TARGET_OPACITY);
+            });
+          });
+        })(j, words[j]);
+      }
+    }, clearDelay);
   }
 
   function clearResponse() {
     if (!responseContainer) return;
-    responseText.textContent = '';
-    responseContainer.classList.remove('visible');
+    var seq = ++responseSeq;
+    var words = responseContainer.querySelectorAll('.word');
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      w.style.transitionDelay = (i * CONFIG.WORD_FADE_OUT_MS) + 'ms';
+      w.style.opacity = '0';
+    }
+    setTimeout(function () {
+      if (seq === responseSeq) responseContainer.innerHTML = '';
+    }, words.length * CONFIG.WORD_FADE_OUT_MS + CONFIG.WORD_FADE_TRANSITION_MS);
   }
 
   // --- Particles ---

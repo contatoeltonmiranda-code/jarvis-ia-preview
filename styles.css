@@ -155,96 +155,37 @@ canvas {
   box-shadow: 0 0 6px rgba(0, 255, 204, 0.6);
 }
 
-/* Transcript (user speech) */
-.transcript-container {
+/* Floating response (Jarvis answer — word-by-word fade) */
+.response-floating {
   position: fixed;
-  top: 25%;
+  top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  z-index: 20;
-  width: min(720px, 85vw);
+  z-index: 5;
+  font-family: inherit;
+  font-size: clamp(28px, 4vw, 46px);
+  font-weight: 200;
+  letter-spacing: 1px;
+  line-height: 1.35;
+  color: #aef0ff;
+  text-shadow: 0 0 20px rgba(174, 240, 255, 0.35);
   text-align: center;
   pointer-events: none;
+  max-width: 80vw;
+  white-space: normal;
+}
+
+.response-floating .word {
+  display: inline-block;
   opacity: 0;
-  transition: opacity 0.4s ease;
-}
-
-.transcript-container.visible {
-  opacity: 1;
-}
-
-.transcript-label {
-  font-size: 10px;
-  letter-spacing: 4px;
-  text-transform: uppercase;
-  color: rgba(0, 212, 255, 0.5);
-  margin-bottom: 8px;
-}
-
-.transcript-text {
-  font-size: clamp(16px, 2.2vw, 22px);
-  font-weight: 300;
-  letter-spacing: 0.5px;
-  color: #ffffff;
-  text-shadow: 0 0 10px rgba(0, 212, 255, 0.3);
-  line-height: 1.4;
-  min-height: 1.4em;
-}
-
-.interim-text {
-  font-size: clamp(14px, 1.8vw, 18px);
-  font-weight: 300;
-  color: rgba(0, 212, 255, 0.55);
-  font-style: italic;
-  line-height: 1.4;
-  margin-top: 4px;
-  min-height: 1em;
-}
-
-/* Response (Jarvis answer) */
-.response-container {
-  position: fixed;
-  bottom: 22%;
-  left: 50%;
-  transform: translate(-50%, 50%);
-  z-index: 20;
-  width: min(720px, 85vw);
-  text-align: center;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.5s ease;
-}
-
-.response-container.visible {
-  opacity: 1;
-}
-
-.response-label {
-  font-size: 10px;
-  letter-spacing: 4px;
-  text-transform: uppercase;
-  color: rgba(0, 255, 204, 0.55);
-  margin-bottom: 8px;
-}
-
-.response-text {
-  font-size: clamp(16px, 2.2vw, 22px);
-  font-weight: 300;
-  letter-spacing: 0.5px;
-  color: #00ffcc;
-  text-shadow: 0 0 14px rgba(0, 255, 204, 0.4);
-  line-height: 1.4;
-  min-height: 1.4em;
+  transition: opacity 600ms ease;
+  margin-right: 0.28em;
 }
 
 @media (max-width: 600px) {
-  .transcript-container {
-    top: 18%;
-    width: 90vw;
-  }
-  .response-container {
-    bottom: 25%;
-    width: 90vw;
+  .response-floating {
+    font-size: clamp(22px, 6vw, 32px);
+    max-width: 90vw;
   }
 }
 
