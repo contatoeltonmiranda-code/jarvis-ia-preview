@@ -229,6 +229,7 @@
   function stopMicrophone() {
     stopRecognition();
     cancelTTS();
+    hideActionBadge();
     lastJarvisReply = '';
 
     if (micStream) {
@@ -455,6 +456,13 @@
     isProcessing = true;
     setStatus('PROCESSANDO', true);
 
+    // If the user's sentence sounds like a command, show a non-dismissing
+    // processing badge until the webhook resolves.
+    var hasActionIntent = detectActionIntent(sentence);
+    if (hasActionIntent) {
+      showActionBadge('processing', 'Executando...', 0);
+    }
+
     // Hard-pause STT while we wait for the reply. abort() discards any
     // audio still in the recognizer's buffer, and we reset the transcript
     // buffer so a stale interim result can't re-trigger handleUserSentence.
@@ -504,6 +512,24 @@
           : 'Desculpe, nao entendi.';
         lastJarvisReply = reply;
         isProcessing = false;
+
+        // Resolve the action badge: keep it shown only if intent OR result
+        // text reads like a command outcome. Otherwise hide any processing
+        // badge that was up.
+        var resultKind = classifyActionResult(reply);
+        if (hasActionIntent || resultKind) {
+          if (resultKind === 'error') {
+            showActionBadge('error', truncateBadge(reply, 50), 5000);
+          } else if (resultKind === 'success') {
+            showActionBadge('success', truncateBadge(reply, 50), 4000);
+          } else if (hasActionIntent) {
+            // intent but ambiguous reply -> treat as success (action ack'd)
+            showActionBadge('success', truncateBadge(reply, 50), 4000);
+          }
+        } else {
+          hideActionBadge();
+        }
+
         speak(reply);
       })
       .catch(function (err) {
@@ -513,6 +539,7 @@
         lastJarvisReply = errReply;
         isProcessing = false;
         console.error('[Jarvis] chat error:', err && err.message);
+        showActionBadge('error', 'FALHA NA CONEXAO', 5000);
         speak(errReply);
       });
   }
@@ -851,6 +878,74 @@
     if (picker) {
       picker.style.display = (ttsProvider === 'webspeech') ? 'flex' : 'none';
     }
+  }
+
+  // --- Action badge (top-right floating status of executed actions) ---
+  var badgeDismissTimer = null;
+  var badgeFadeTimer = null;
+
+  function detectActionIntent(text) {
+    if (!text) return false;
+    return /\b(ativ|dispar|rod[ae]|execut|liga[r]?|aciona)/i.test(text);
+  }
+
+  function classifyActionResult(text) {
+    if (!text) return null;
+    if (/\b(falh|erro|n[aã]o (encontr|consegu|achei|deu)|imposs[ií]vel|indispon[ií]vel)/i.test(text)) {
+      return 'error';
+    }
+    if (/\b(ativad|executad|disparad|rodand|acionad|conclu[ií]d|pronto|feito|sucesso|ok)/i.test(text)) {
+      return 'success';
+    }
+    return null;
+  }
+
+  function showActionBadge(type, message, autoDismissMs) {
+    if (badgeDismissTimer) { clearTimeout(badgeDismissTimer); badgeDismissTimer = null; }
+    if (badgeFadeTimer) { clearTimeout(badgeFadeTimer); badgeFadeTimer = null; }
+
+    var existing = document.getElementById('action-badge');
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+
+    var badge = document.createElement('div');
+    badge.id = 'action-badge';
+    badge.className = 'action-badge ' + type;
+
+    var icon = document.createElement('span');
+    icon.className = 'badge-icon';
+    var label = document.createElement('span');
+    label.className = 'badge-text';
+    label.textContent = String(message || '').toUpperCase();
+
+    badge.appendChild(icon);
+    badge.appendChild(label);
+    document.body.appendChild(badge);
+
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { badge.classList.add('visible'); });
+    });
+
+    if (autoDismissMs && autoDismissMs > 0) {
+      badgeDismissTimer = setTimeout(function () { hideActionBadge(); }, autoDismissMs);
+    }
+  }
+
+  function hideActionBadge() {
+    if (badgeDismissTimer) { clearTimeout(badgeDismissTimer); badgeDismissTimer = null; }
+    if (badgeFadeTimer) { clearTimeout(badgeFadeTimer); badgeFadeTimer = null; }
+    var badge = document.getElementById('action-badge');
+    if (!badge) return;
+    badge.classList.remove('visible');
+    badgeFadeTimer = setTimeout(function () {
+      if (badge.parentNode) badge.parentNode.removeChild(badge);
+      badgeFadeTimer = null;
+    }, 400);
+  }
+
+  function truncateBadge(text, max) {
+    var s = String(text || '').trim();
+    if (s.length <= max) return s;
+    return s.slice(0, max - 1).trim() + '\u2026';
   }
 
   // --- Floating response UI (word-by-word fade) ---
