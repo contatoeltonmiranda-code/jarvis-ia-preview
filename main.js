@@ -514,17 +514,17 @@
         isProcessing = false;
 
         // Resolve the action badge: keep it shown only if intent OR result
-        // text reads like a command outcome. Otherwise hide any processing
-        // badge that was up.
+        // text reads like a command outcome. Show full message (no truncation),
+        // 8s dwell time. Otherwise hide any processing badge that was up.
         var resultKind = classifyActionResult(reply);
         if (hasActionIntent || resultKind) {
           if (resultKind === 'error') {
-            showActionBadge('error', truncateBadge(reply, 50), 5000);
+            showActionBadge('error', reply, 8000);
           } else if (resultKind === 'success') {
-            showActionBadge('success', truncateBadge(reply, 50), 4000);
+            showActionBadge('success', reply, 8000);
           } else if (hasActionIntent) {
             // intent but ambiguous reply -> treat as success (action ack'd)
-            showActionBadge('success', truncateBadge(reply, 50), 4000);
+            showActionBadge('success', reply, 8000);
           }
         } else {
           hideActionBadge();
@@ -539,7 +539,7 @@
         lastJarvisReply = errReply;
         isProcessing = false;
         console.error('[Jarvis] chat error:', err && err.message);
-        showActionBadge('error', 'FALHA NA CONEXAO', 5000);
+        showActionBadge('error', 'Falha na conexao', 8000);
         speak(errReply);
       });
   }
@@ -915,7 +915,9 @@
     icon.className = 'badge-icon';
     var label = document.createElement('span');
     label.className = 'badge-text';
-    label.textContent = String(message || '').toUpperCase();
+    // textContent (not innerHTML) — XSS-safe by default. Case is preserved
+    // because messages now carry full-sentence replies; CSS handles display.
+    label.textContent = String(message || '');
 
     badge.appendChild(icon);
     badge.appendChild(label);
@@ -940,12 +942,6 @@
       if (badge.parentNode) badge.parentNode.removeChild(badge);
       badgeFadeTimer = null;
     }, 400);
-  }
-
-  function truncateBadge(text, max) {
-    var s = String(text || '').trim();
-    if (s.length <= max) return s;
-    return s.slice(0, max - 1).trim() + '\u2026';
   }
 
   // --- Floating response UI (word-by-word fade) ---
