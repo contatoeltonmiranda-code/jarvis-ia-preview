@@ -41,6 +41,12 @@
     WORD_FADE_OUT_MS: 60,
     WORD_FADE_TRANSITION_MS: 600,
     WORD_TARGET_OPACITY: 0.5,
+    WAKE_WORD_STORAGE_KEY: 'jarvis.wakeword.enabled',
+    AWAKE_WINDOW_MS: 5000,
+    WAKE_WORDS: [
+      'jarvis', 'javis', 'darvis', 'jarvi', 'jarves', 'arvis',
+      'jarves', 'gervis', 'jervis', 'jarbes', 'gravis',
+    ],
   };
 
   // --- State ---
@@ -77,11 +83,15 @@
   var isProcessing = false;
   var lastJarvisReply = '';
   var sttResumeTimer = null;
+  var wakeWordEnabled = true;
+  var isAwake = false;
+  var awakeTimer = null;
 
   // DOM elements
   var micBtn, statusText, volumeMeter, volumeBars;
   var responseContainer;
   var voiceSelect, providerToggle;
+  var wakeToggle;
   var responseSeq = 0;
 
   // --- Initialization ---
@@ -95,19 +105,25 @@
     responseContainer = document.getElementById('response-container');
     voiceSelect = document.getElementById('voice-select');
     providerToggle = document.getElementById('provider-toggle');
+    wakeToggle = document.getElementById('wake-toggle');
 
-    // Restore voice preference
+    // Restore voice preference + wake-word toggle
     try {
       userPickedVoiceURI = localStorage.getItem(CONFIG.VOICE_STORAGE_KEY);
       var savedProvider = localStorage.getItem(CONFIG.TTS_PROVIDER_STORAGE_KEY);
       if (savedProvider === 'webspeech' || savedProvider === 'elevenlabs') {
         ttsProvider = savedProvider;
       }
+      var savedWake = localStorage.getItem(CONFIG.WAKE_WORD_STORAGE_KEY);
+      if (savedWake === '0' || savedWake === '1') {
+        wakeWordEnabled = (savedWake === '1');
+      }
     } catch (err) {
       userPickedVoiceURI = null;
     }
 
     setupProviderToggle();
+    setupWakeToggle();
 
     // Create volume bars
     createVolumeBars(20);
@@ -214,7 +230,7 @@
 
         isListening = true;
         micBtn.classList.add('active');
-        setStatus('OUVINDO', true);
+        setStatus(idleListeningLabel(), true);
         volumeMeter.classList.add('visible');
 
         // Start STT alongside the audio stream
@@ -230,6 +246,8 @@
     stopRecognition();
     cancelTTS();
     hideActionBadge();
+    if (awakeTimer) { clearTimeout(awakeTimer); awakeTimer = null; }
+    isAwake = false;
     lastJarvisReply = '';
 
     if (micStream) {
@@ -441,6 +459,55 @@
     return unionSize ? inter / unionSize : 0;
   }
 
+  // --- Wake word ---
+  function hasWakeWord(transcript) {
+    if (!transcript) return null;
+    var t = normalizeText(transcript); // lowercase + strip accents + spaces
+    // Allow optional vocative prefix: "hey jarvis", "ei jarvis", "o jarvis"
+    var prefixed = t.replace(/^(hey|ei|o|oi|ola|opa)\s+/, '');
+    var words = CONFIG.WAKE_WORDS;
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      if (prefixed === w || prefixed.indexOf(w + ' ') === 0) return w;
+    }
+    return null;
+  }
+
+  function stripWakeWord(transcript, wakeWord) {
+    if (!transcript || !wakeWord) return '';
+    // Strip optional vocative prefix + the wake word + optional punctuation.
+    // Case-insensitive; preserves the rest of the transcript verbatim.
+    var re = new RegExp('^\\s*(?:hey|ei|o|oi|ola|opa)?\\s*' + wakeWord + '[\\s,\\.;:!\\?]*', 'i');
+    return String(transcript).replace(re, '').trim();
+  }
+
+  function idleListeningLabel() {
+    // What the status should show when the mic is open and we're not
+    // speaking/processing. Depends on wake-word mode + active window.
+    if (!wakeWordEnabled) return 'OUVINDO';
+    return isAwake ? 'OUVINDO' : 'AGUARDANDO';
+  }
+
+  function applyIdleStatus() {
+    if (!isListening || isSpeaking || isProcessing) return;
+    setStatus(idleListeningLabel(), true);
+  }
+
+  function enterAwakeMode() {
+    isAwake = true;
+    if (awakeTimer) clearTimeout(awakeTimer);
+    awakeTimer = setTimeout(function () {
+      exitAwakeMode();
+    }, CONFIG.AWAKE_WINDOW_MS);
+    applyIdleStatus();
+  }
+
+  function exitAwakeMode() {
+    isAwake = false;
+    if (awakeTimer) { clearTimeout(awakeTimer); awakeTimer = null; }
+    applyIdleStatus();
+  }
+
   function handleUserSentence(sentence) {
     // Echo guard: if the STT picked up something very similar to the last
     // Jarvis reply, assume it's mic feedback (TTS bleed-through) and drop it.
@@ -450,6 +517,38 @@
         console.log('[Jarvis] echo detected (sim=' + sim.toFixed(2) + '), ignoring:', sentence);
         return;
       }
+    }
+
+    // Wake-word gate: when enabled, a sentence must start with "Jarvis"
+    // (or a tolerated misspelling). Otherwise it's ambient speech and we
+    // ignore it. If user is already in the active window, they can issue
+    // follow-up commands without saying "Jarvis" again.
+    if (wakeWordEnabled && !isAwake) {
+      var wake = hasWakeWord(sentence);
+      if (!wake) {
+        console.log('[Jarvis] no wake word, ignoring:', sentence);
+        return;
+      }
+      var command = stripWakeWord(sentence, wake);
+      if (!command) {
+        // User said only "Jarvis" — open the active window and acknowledge.
+        enterAwakeMode();
+        lastJarvisReply = 'Sim, Elton?';
+        speak('Sim, Elton?');
+        return;
+      }
+      // Has wake word + command — enter active mode and process the command.
+      enterAwakeMode();
+      sentence = command;
+    } else if (wakeWordEnabled && isAwake) {
+      // Already awake: optionally strip a re-spoken wake word from the start
+      var maybeWake = hasWakeWord(sentence);
+      if (maybeWake) {
+        var stripped = stripWakeWord(sentence, maybeWake);
+        if (stripped) sentence = stripped;
+      }
+      // Refresh the active window
+      enterAwakeMode();
     }
 
     var seq = ++chatRequestSeq;
@@ -814,7 +913,7 @@
     isSpeaking = false;
     ttsLevel = 0;
     if (isListening) {
-      setStatus('OUVINDO', true);
+      setStatus(idleListeningLabel(), true);
       // Resume STT with a small delay so the tail of the TTS audio
       // (especially on bluetooth / cheap speakers with latency) doesn't
       // bleed into the mic and trigger another round.
@@ -877,6 +976,33 @@
     var picker = document.querySelector('.voice-picker');
     if (picker) {
       picker.style.display = (ttsProvider === 'webspeech') ? 'flex' : 'none';
+    }
+  }
+
+  // --- Wake-word toggle ---
+  function setupWakeToggle() {
+    if (!wakeToggle) return;
+    applyWakeToggleUI();
+    wakeToggle.addEventListener('click', function () {
+      wakeWordEnabled = !wakeWordEnabled;
+      try { localStorage.setItem(CONFIG.WAKE_WORD_STORAGE_KEY, wakeWordEnabled ? '1' : '0'); } catch (err) { /* noop */ }
+      // Switching off cancels any pending awake window.
+      if (!wakeWordEnabled) exitAwakeMode();
+      applyWakeToggleUI();
+      applyIdleStatus();
+    });
+  }
+
+  function applyWakeToggleUI() {
+    if (!wakeToggle) return;
+    if (wakeWordEnabled) {
+      wakeToggle.classList.add('on');
+      wakeToggle.setAttribute('aria-pressed', 'true');
+      wakeToggle.title = 'Wake word ON — diga "Jarvis ..."';
+    } else {
+      wakeToggle.classList.remove('on');
+      wakeToggle.setAttribute('aria-pressed', 'false');
+      wakeToggle.title = 'Wake word OFF — fala livre';
     }
   }
 
@@ -1267,6 +1393,12 @@
       audioLevel = ttsLevel;
     } else if (isListening) {
       audioLevel = getAudioLevel();
+      // When the wake-word window is active, lift the floor so the circle
+      // glows brighter — visual cue that Jarvis is in command mode.
+      if (isAwake) {
+        var floor = 0.32 + Math.abs(Math.sin(time * 0.006)) * 0.08;
+        if (audioLevel < floor) audioLevel = floor;
+      }
     } else {
       audioLevel *= 0.95; // fade out
     }

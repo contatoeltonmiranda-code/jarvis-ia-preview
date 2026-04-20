@@ -107,6 +107,68 @@ canvas {
   50% { box-shadow: 0 0 40px rgba(0, 255, 204, 0.6); }
 }
 
+/* Mic + wake-toggle row */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wake-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 212, 255, 0.3);
+  background: rgba(0, 212, 255, 0.05);
+  color: rgba(0, 212, 255, 0.6);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, color 0.2s, box-shadow 0.2s;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.wake-toggle:hover {
+  border-color: rgba(0, 212, 255, 0.7);
+  color: #00d4ff;
+}
+
+.wake-toggle.on {
+  border-color: rgba(0, 255, 204, 0.7);
+  background: rgba(0, 255, 204, 0.08);
+  color: #00ffcc;
+  box-shadow: 0 0 14px rgba(0, 255, 204, 0.25);
+}
+
+.wake-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  opacity: 0.8;
+}
+
+.wake-toggle.on .wake-dot {
+  animation: wake-pulse 1.6s infinite ease-in-out;
+}
+
+@keyframes wake-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.7); }
+}
+
+.wake-label {
+  display: inline-block;
+}
+
 .title {
   position: fixed;
   top: 24px;
