@@ -86,6 +86,7 @@
   var wakeWordEnabled = true;
   var isAwake = false;
   var awakeTimer = null;
+  var pendingE2ELabel = null;
 
   // DOM elements
   var micBtn, statusText, volumeMeter, volumeBars;
@@ -555,6 +556,11 @@
     isProcessing = true;
     setStatus('PROCESSANDO', true);
 
+    // End-to-end timing marker (user sentence committed -> audio audible).
+    // Closed in attachAudioElement on `playing`, or abandoned on error.
+    pendingE2ELabel = 'jarvis-e2e-' + seq;
+    try { console.time(pendingE2ELabel); } catch (e) { /* noop */ }
+
     // If the user's sentence sounds like a command, show a non-dismissing
     // processing badge until the webhook resolves.
     var hasActionIntent = detectActionIntent(sentence);
@@ -817,62 +823,29 @@
     if (controller) fetchOpts.signal = controller.signal;
 
     var t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+    var tHeaders = 0;
+    var tFirstByte = 0;
 
     fetch(CONFIG.ELEVENLABS_WEBHOOK_URL, fetchOpts)
       .then(function (res) {
         if (!res.ok) {
           throw new Error('ElevenLabs webhook HTTP ' + res.status);
         }
-        return res.blob();
+        tHeaders = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+        console.log('[Jarvis] TTS headers in', Math.round(tHeaders - t0) + 'ms');
+
+        // Prefer streaming playback via MediaSource when supported. Lets
+        // audio.oncanplay fire as soon as enough bytes buffered — user hears
+        // Jarvis speak before the full mp3 has finished downloading.
+        if (supportsMediaSourceMp3() && res.body && typeof res.body.getReader === 'function') {
+          return playViaMediaSource(res, seq, t0, text);
+        }
+        return res.blob().then(function (blob) {
+          return playViaBlob(blob, seq, t0, text);
+        });
       })
-      .then(function (blob) {
+      .then(function () {
         clearTimeout(timeoutId);
-        if (seq !== ttsRequestSeq) {
-          // Another speak() call superseded this one; discard
-          return;
-        }
-        var t1 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-        console.log('[Jarvis] ElevenLabs TTS latency:', Math.round(t1 - t0) + 'ms');
-
-        var url = URL.createObjectURL(blob);
-        currentAudioURL = url;
-        var audio = new Audio(url);
-        currentAudio = audio;
-
-        // CRITICAL: set isSpeaking=true BEFORE play(). Doing this in
-        // audio.onplay leaves a window where the TTS is starting to come
-        // out of the speakers but the STT guard still sees isSpeaking=false,
-        // and any onend/onresult firing in that window will re-open the mic.
-        isProcessing = false;
-        isSpeaking = true;
-        setStatus('FALANDO', true);
-        pauseRecognitionForTTS();
-
-        audio.onplay = function () {
-          // Reaffirm the abort once playback truly starts — covers cases
-          // where Chrome might have re-attached the recognizer.
-          pauseRecognitionForTTS();
-        };
-        audio.onended = function () {
-          releaseAudio();
-          handleTTSEnd();
-        };
-        audio.onerror = function () {
-          console.warn('[Jarvis] Audio playback error — falling back to Web Speech.');
-          releaseAudio();
-          speakWebSpeech(text);
-        };
-
-        var playPromise = audio.play();
-        if (playPromise && typeof playPromise.catch === 'function') {
-          playPromise.catch(function (err) {
-            console.warn('[Jarvis] audio.play() rejected:', err && err.message);
-            releaseAudio();
-            // Reset flags so fallback can re-set them
-            isSpeaking = false;
-            speakWebSpeech(text);
-          });
-        }
       })
       .catch(function (err) {
         clearTimeout(timeoutId);
@@ -881,6 +854,151 @@
         console.warn('[Jarvis] ElevenLabs failed, fallback to Web Speech:', err && err.message);
         speakWebSpeech(text);
       });
+  }
+
+  function supportsMediaSourceMp3() {
+    return (
+      typeof window.MediaSource !== 'undefined' &&
+      typeof window.MediaSource.isTypeSupported === 'function' &&
+      window.MediaSource.isTypeSupported('audio/mpeg')
+    );
+  }
+
+  function attachAudioElement(audio, seq, t0, text) {
+    currentAudio = audio;
+
+    // CRITICAL: set isSpeaking=true BEFORE play(). Doing this inside
+    // audio.onplay leaves a window where the mp3 is starting to come out of
+    // the speakers but the STT guard still sees isSpeaking=false.
+    isProcessing = false;
+    isSpeaking = true;
+    setStatus('FALANDO', true);
+    pauseRecognitionForTTS();
+
+    audio.oncanplay = function () {
+      var tReady = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      console.log('[Jarvis] TTS canplay in', Math.round(tReady - t0) + 'ms');
+    };
+    audio.onplaying = function () {
+      var tPlaying = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      console.log('[Jarvis] TTS first audible in', Math.round(tPlaying - t0) + 'ms');
+      if (pendingE2ELabel) {
+        try { console.timeEnd(pendingE2ELabel); } catch (e) { /* noop */ }
+        pendingE2ELabel = null;
+      }
+    };
+    audio.onplay = function () {
+      // Reaffirm the abort once playback truly starts.
+      pauseRecognitionForTTS();
+    };
+    audio.onended = function () {
+      releaseAudio();
+      handleTTSEnd();
+    };
+    audio.onerror = function () {
+      console.warn('[Jarvis] Audio playback error — falling back to Web Speech.');
+      releaseAudio();
+      if (pendingE2ELabel) {
+        try { console.timeEnd(pendingE2ELabel); } catch (e) { /* noop */ }
+        pendingE2ELabel = null;
+      }
+      // Reset flags so fallback can re-set them
+      isSpeaking = false;
+      speakWebSpeech(text);
+    };
+
+    var playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(function (err) {
+        console.warn('[Jarvis] audio.play() rejected:', err && err.message);
+        releaseAudio();
+        isSpeaking = false;
+        speakWebSpeech(text);
+      });
+    }
+  }
+
+  function playViaMediaSource(res, seq, t0, text) {
+    return new Promise(function (resolve, reject) {
+      var mediaSource = new MediaSource();
+      var url = URL.createObjectURL(mediaSource);
+      currentAudioURL = url;
+      var audio = new Audio();
+      audio.src = url;
+
+      var sourceBuffer = null;
+      var queue = [];
+      var reader = res.body.getReader();
+      var firstChunkLogged = false;
+      var streamEnded = false;
+
+      function flushQueue() {
+        if (!sourceBuffer || sourceBuffer.updating) return;
+        if (queue.length === 0) {
+          if (streamEnded && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch (e) { /* noop */ }
+          }
+          return;
+        }
+        try {
+          sourceBuffer.appendBuffer(queue.shift());
+        } catch (err) {
+          console.warn('[Jarvis] appendBuffer failed, falling back:', err && err.message);
+          reject(err);
+        }
+      }
+
+      function pump() {
+        return reader.read().then(function (result) {
+          if (seq !== ttsRequestSeq) {
+            try { reader.cancel(); } catch (e) { /* noop */ }
+            return;
+          }
+          if (!firstChunkLogged && result.value) {
+            firstChunkLogged = true;
+            var tFB = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+            console.log('[Jarvis] TTS first byte in', Math.round(tFB - t0) + 'ms');
+          }
+          if (result.done) {
+            streamEnded = true;
+            flushQueue();
+            resolve();
+            return;
+          }
+          queue.push(result.value);
+          flushQueue();
+          return pump();
+        });
+      }
+
+      mediaSource.addEventListener('sourceopen', function () {
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+          sourceBuffer.addEventListener('updateend', flushQueue);
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        attachAudioElement(audio, seq, t0, text);
+        pump().catch(reject);
+      });
+
+      mediaSource.addEventListener('sourceended', function () {
+        var tEnd = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+        console.log('[Jarvis] TTS stream fully buffered in', Math.round(tEnd - t0) + 'ms');
+      });
+    });
+  }
+
+  function playViaBlob(blob, seq, t0, text) {
+    if (seq !== ttsRequestSeq) return;
+    var t1 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+    console.log('[Jarvis] TTS blob ready in', Math.round(t1 - t0) + 'ms');
+
+    var url = URL.createObjectURL(blob);
+    currentAudioURL = url;
+    var audio = new Audio(url);
+    attachAudioElement(audio, seq, t0, text);
   }
 
   function speakWebSpeech(text) {
